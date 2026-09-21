@@ -1,0 +1,17 @@
+{
+  "name": "kindle",
+  "app": "Kindle",
+  "bundle_id": "com.amazon.Lassen",
+  "opens_documents": false,
+  "notes": "Kindle for Mac. Open the book yourself and run with --no-open. Pages turn with the right arrow key. Choose a single-column layout and a fixed font size in the reader settings before capturing; the app renders the next page slightly after the key press, which the settle check absorbs. The reader exposes no accessibility elements, so a page where Vision finds no text (blank page, full-page image) is reported by Peekaboo as ACCESSIBILITY_INCOMPLETE and recorded as an empty page.",
+  "setup": [],
+  "advance": {
+    "mode": "key",
+    "key": "right",
+    "menu": null
+  },
+  "window": {
+    "width": 900,
+    "height": null
+  }
+}

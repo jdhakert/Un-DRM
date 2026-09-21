@@ -1,0 +1,7 @@
+captures/
+*.pyc
+__pycache__/
+.tools/
+.assemble/
+.DS_Store
+tools/vision-ocr

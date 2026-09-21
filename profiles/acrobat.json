@@ -1,0 +1,13 @@
+{
+  "name": "acrobat",
+  "app": "Adobe Acrobat Reader",
+  "bundle_id": "com.adobe.Reader",
+  "opens_documents": true,
+  "notes": "Adobe Acrobat Reader. If you use the full Acrobat, pass --app \"Adobe Acrobat\". Check exact menu titles with `peekaboo menu list --pid <pid>`.",
+  "setup": [
+    {"menu": "View > Page Display > Single Page View"},
+    {"menu": "View > Zoom > Zoom to Page Level", "optional": true}
+  ],
+  "advance": {"mode": "menu", "menu": "View > Page Navigation > Next Page", "key": "right"},
+  "window": {"width": 1000, "height": null}
+}

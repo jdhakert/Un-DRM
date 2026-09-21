@@ -1,0 +1,14 @@
+{
+  "name": "preview-optional",
+  "app": "Preview",
+  "bundle_id": "com.apple.Preview",
+  "opens_documents": true,
+  "setup": [
+    {"menu": "View > Single Page"},
+    {"menu": "View > Content Only", "optional": true},
+    {"menu": "View > Hide Bogus Panel", "optional": true},
+    {"menu": "View > Zoom to Fit", "optional": true}
+  ],
+  "advance": {"mode": "menu", "menu": "Go > Next Page", "key": "right"},
+  "window": {"width": 1000, "height": null}
+}

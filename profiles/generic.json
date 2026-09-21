@@ -1,0 +1,10 @@
+{
+  "name": "generic",
+  "app": null,
+  "bundle_id": null,
+  "opens_documents": false,
+  "notes": "Starting point for any other viewer: pass --app, open the document yourself (--no-open), and pick --advance/--next-key or --next-menu after inspecting `peekaboo menu list --app <App>`.",
+  "setup": [],
+  "advance": {"mode": "key", "key": "right", "menu": null},
+  "window": {"width": 1000, "height": null}
+}

@@ -1,0 +1,17 @@
+{
+  "name": "books",
+  "app": "Books",
+  "bundle_id": "com.apple.iBooksX",
+  "opens_documents": false,
+  "notes": "Apple Books. Open the book yourself and run with --no-open (Books opens its library window, not a file). Pages turn with the right arrow key; set a single-column layout in the book's appearance settings before capturing. Reflowable books change pagination with window size, so keep the window size fixed for the whole run. Pages with no recognizable text are recorded as empty pages.",
+  "setup": [],
+  "advance": {
+    "mode": "key",
+    "key": "right",
+    "menu": null
+  },
+  "window": {
+    "width": 900,
+    "height": null
+  }
+}

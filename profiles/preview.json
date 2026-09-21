@@ -1,0 +1,14 @@
+{
+  "name": "preview",
+  "app": "Preview",
+  "bundle_id": "com.apple.Preview",
+  "opens_documents": true,
+  "notes": "Apple Preview (PDF and images). Menu titles are verified at run time against `peekaboo menu list --pid <pid>`; adjust them if your macOS version names them differently.",
+  "setup": [
+    {"menu": "View > Single Page"},
+    {"menu": "View > Hide Sidebar", "optional": true},
+    {"menu": "View > Zoom to Fit", "optional": true}
+  ],
+  "advance": {"mode": "menu", "menu": "Go > Next Page", "key": "right"},
+  "window": {"width": 1000, "height": null}
+}

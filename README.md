@@ -16,7 +16,8 @@ what was saved.
 ## Requirements
 
 - macOS 15 or later.
-- Peekaboo 4.4 or later, which added `see --ocr`:
+- Peekaboo 4.1 or later, which added `see --ocr`; 4.4 or later is recommended
+  (it fixed captures being refused while Claude or OpenClaw is running):
   `brew install openclaw/tap/peekaboo` (this fork tracks the openclaw line).
 - Screen Recording and Accessibility granted to the Peekaboo host
   (`peekaboo permissions status`, `peekaboo permissions grant`). Event Synthesizing
@@ -45,9 +46,12 @@ open the book yourself, go to the first page, then:
 ./undrm_assemble.py captures/kindle-20260921-113000
 ```
 
-Leave the Mac alone while the capture runs. Everything is background-safe except
-foreground key presses, which the script only falls back to when the viewer refuses
-background delivery (it says so in the log).
+Leave the Mac alone while the capture runs. The script brings the viewer to the
+front once at the start (`app launch --foreground`, which Peekaboo requires for
+`--open`, then `window focus`); after that the probes, the `see --ocr` captures and
+menu-based page turns run in the background and do not touch focus. Only key
+presses may fall back to foreground delivery, and only when Peekaboo refuses
+background delivery before dispatching anything (the log says so).
 
 ## Step 1 and 2: `undrm_capture.py`
 
@@ -61,11 +65,11 @@ What it does, in Peekaboo terms:
 2. `app launch <Viewer> --open <doc> --foreground --wait-ready --wait-for-window`,
    then `window list --pid` to find the document window (new window whose title
    contains the file name; override with `--window-title` or `--window-id`).
-3. `window focus --verify`, `window set-bounds` (default 1000 pt wide, screen
-   height minus 80), then the profile's setup menus via `menu click --pid --path`.
-   Missing optional items (for example "Hide Sidebar" when the sidebar is already
-   hidden) are skipped; a missing required item aborts with the closest matches
-   from `menu list`.
+3. `window focus --verify`, `window set-bounds` (default 1000 pt wide, visible
+   screen height minus 80, at least 600), then the profile's setup menus via
+   `menu click --pid --path`. Missing optional items (for example "Content Only"
+   on an older Preview) are skipped; a missing required item aborts with the
+   closest matches from `menu list`.
 4. Per page:
    - **Page-loaded check.** `see --no-elements` probes of the exact window are
      hashed until two consecutive probes are identical (`--settle-samples`,
@@ -77,19 +81,26 @@ What it does, in Peekaboo terms:
      OCR rows come back as `staticText` elements with global logical bounds and a
      confidence; the raw envelope is saved as `pages/page-NNNN.json`. Pages with
      fewer than `--min-chars` characters are retried after a delay (blank pages
-     are accepted after the retries, with a note).
-   - **Post-check.** One more probe confirms the page did not change while it was
-     being OCRed.
+     are accepted after the retries, with a note). A page that has neither
+     accessibility elements nor recognizable text makes Peekaboo report
+     `ACCESSIBILITY_INCOMPLETE`; the PNG it already wrote is kept and the page is
+     recorded as empty.
+   - **Post-check.** The capture is bracketed by probes: if the window changed
+     while it was being OCRed, the page is captured again until two probes agree
+     (bounded by `--settle-timeout`).
    - **Advance.** `menu click --path "Go > Next Page"` (Preview, Acrobat) or
-     `press right --window-id` (Books, Kindle, generic), per the profile or
+     `press right --pid --window-id` (Books, Kindle, generic), per the profile or
      `--advance`, `--next-menu`, `--next-key`.
-   - `clean --snapshot` prunes Peekaboo's copy of the capture so the snapshot cache
-     does not fill the disk (`--keep-snapshots` to skip).
+   - `clean --snapshot` removes Peekaboo's on-disk copy of each capture when `see`
+     ran in-process; on the default daemon route the snapshots live in the daemon's
+     memory (it prunes them itself), `clean` answers `not_found` and the script
+     stops issuing clean calls (`--keep-snapshots` skips them entirely).
 5. `manifest.json` is rewritten after every page, so an interrupted run (Ctrl-C)
    still assembles.
 
-Useful options: `--pages N` (exact page count), `--width/--height/--x/--y`,
-`--no-resize`, `--skip-setup`, `--setup-menu "View > Single Page"`,
+Useful options: `--pages N` (stop after N pages; the run still ends earlier at the
+end of the document), `--width/--height/--x/--y`, `--no-resize`, `--skip-setup`
+(profile setup only; `--setup-menu "View > Single Page"` still runs),
 `--settle-timeout`, `--see-timeout`, `--no-retina`, `--verbose` (prints every
 `peekaboo` command). `./undrm_capture.py --help` lists them all.
 
@@ -102,7 +113,7 @@ matches when one is missing, so adjusting a profile is a one-line change.
 
 | Profile | App | Setup | Advance |
 | --- | --- | --- | --- |
-| `preview` | Preview | View > Single Page, Hide Sidebar, Zoom to Fit | Go > Next Page |
+| `preview` | Preview | View > Single Page, Content Only, Zoom to Fit | Go > Next Page |
 | `acrobat` | Adobe Acrobat Reader | View > Page Display > Single Page View | View > Page Navigation > Next Page |
 | `books` | Books | none (set a single-column layout in the app first) | right arrow |
 | `kindle` | Kindle | none (set a single-column layout in the app first) | right arrow |
@@ -116,11 +127,11 @@ and advance entries after looking at `peekaboo menu list --app <App>`.
 - `peekaboo` (default): `see --ocr`, which runs Apple Vision locally on the
   Peekaboo host in *fast* mode. On Retina captures of rendered text this is
   usually clean.
-- `vision`: `tools/vision-ocr.swift`, Apple Vision in *accurate* mode, compiled on
-  first use (needs `swiftc`). The capture script switches to it automatically when
-  `see --ocr` refuses a window that exposes no accessibility elements
-  (`ACCESSIBILITY_INCOMPLETE`), or on request with `--ocr-engine vision`. The
-  assembler can also re-run it on an existing capture with `--reocr`.
+- `vision` (`--ocr-engine vision`): `tools/vision-ocr.swift`, Apple Vision in
+  *accurate* mode, compiled once into `tools/` on first use (needs `swiftc`). The
+  assembler can also re-run it on an existing capture with `--reocr`, so the
+  usual path is to capture with the default engine and re-OCR later if the fast
+  engine stumbled on small type.
 
 ## Step 3: `undrm_assemble.py`
 
@@ -132,12 +143,17 @@ It reads `manifest.json` and each page's OCR JSON, converts the OCR boxes to
 window-relative points, and reconstructs reading order:
 
 1. Recursive XY-cut: split on the widest vertical whitespace gap (columns), else
-   the widest horizontal gap (rows), until no gap is left. Headers and footers
-   that span both columns come out first and last.
+   the widest horizontal gap (rows), until no gap is left. A vertical cut is only
+   accepted when both sides are wide enough to be text columns, so list markers,
+   speaker names and table-of-contents page numbers stay with their lines.
+   Headers and footers that span both columns come out first and last.
 2. Fragments on one baseline are merged left to right; lines become paragraphs at
-   larger vertical gaps or first-line indents.
-3. Words hyphenated across lines are rejoined (`--no-dehyphenate` to keep them).
-   `--keep-lines` preserves the OCR line breaks instead of reflowing paragraphs.
+   larger vertical gaps, first-line indents, or (for hanging-indent layouts such
+   as outlines and bibliographies) at each flush-left line.
+3. Words hyphenated across lines are rejoined (`--no-dehyphenate` to keep them;
+   compound words that happen to break at their hyphen are joined too, the raw
+   lines in `document.json` show what was joined). `--keep-lines` preserves the
+   OCR line breaks instead of reflowing paragraphs.
 
 Outputs:
 
@@ -146,11 +162,15 @@ Outputs:
 - `document.json`: per page text, paragraphs and every line with confidence and
   bounds.
 - `document.pdf`: each page image (JPEG via `sips`, or `--pdf-image png` for
-  lossless 8-bit RGB PNGs) with an invisible Helvetica text layer placed on the
-  OCR boxes, so Preview, Acrobat and Spotlight can search and copy the text.
+  lossless embedding; captures with an alpha channel are flattened with Pillow
+  when it is installed, otherwise they fall back to JPEG) with an invisible
+  Helvetica text layer placed on the OCR boxes, so Preview, Acrobat and Spotlight
+  can search and copy the text. Characters outside WinAnsi (Greek, math, CJK)
+  become `?` in that layer only; the script reports how many.
   `--pdf-visible-text` draws the layer in red for checking alignment.
 
-`--pages 1-10,15` limits the output, `--min-confidence 0.5` drops weak OCR lines.
+`--pages 1-10,15` limits the output, `--min-confidence 0.5` drops weak OCR lines,
+`--col-gap 0.6` helps with very tight column gutters.
 
 ## How the page-loaded check works
 
@@ -158,9 +178,11 @@ A page is considered loaded when two consecutive exact-window captures have the
 same SHA-256 and differ from the previous page's capture. Page-turn animations,
 progressive rendering and lazy image loads all show up as changing pixels and are
 waited out. A viewer that keeps animating something (a blinking caret, a clock)
-never settles; the script then captures after `--settle-timeout` and notes it in
-the manifest. Because the check is pixel-exact, keep the window size fixed for
-the whole run and do not move other windows over it.
+never settles; the script then captures after `--settle-timeout` and falls back
+to the recognized text to detect the last page: when the text of a captured page
+matches the previous page after advancing, it advances again, and gives up after
+`--end-retries` repeats. Because the check is pixel-exact, keep the window size
+fixed for the whole run and do not move other windows over it.
 
 ## Limitations
 
@@ -168,7 +190,11 @@ the whole run and do not move other windows over it.
   for the window size used during the capture.
 - Two consecutive pages that are pixel-identical are recorded as a duplicate
   (blank pages), and a page turn that the viewer silently dropped looks the same.
-  Check the `warnings` in `manifest.json` when the page count is off.
+  A page that takes longer than `--end-grace` to render after a page turn can be
+  mistaken for "no change"; raise `--end-grace` for slow viewers. Check the
+  `warnings` in `manifest.json` when the page count is off.
+- For a viewer that never settles, two consecutive pages with identical text
+  (two blank pages) cannot be told apart and only one is kept.
 - OCR is OCR: check numbers, citations and tables against the images in
   `document.md`, and use `--reocr` (accurate Vision) when the fast engine
   stumbles on small type.
@@ -179,9 +205,9 @@ the whole run and do not move other windows over it.
 
 ## Troubleshooting
 
-- `peekaboo see --ocr` reports `ACCESSIBILITY_INCOMPLETE`: the viewer exposes no
-  accessibility elements for that window. Install the Swift toolchain and rerun;
-  the Vision engine takes over automatically.
+- `peekaboo see --ocr` reports `ACCESSIBILITY_INCOMPLETE`: that page had neither
+  accessibility elements nor recognizable text (blank page, full-page image). The
+  page image is kept and the page is recorded with 0 characters and a warning.
 - Background `press` is refused: grant Event Synthesizing
   (`peekaboo permissions request event-synthesizing`) or prefer a menu-based
   advance (`--advance menu --next-menu "Go > Next Page"`). The script falls back to

@@ -47,6 +47,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 VISION_TOOL_SOURCE = SCRIPT_DIR / "tools" / "vision-ocr.swift"
 
 
+def vision_build_dir() -> Path:
+    """Where the compiled Vision helper lives: next to its source when writable, else a cache dir."""
+    candidate = VISION_TOOL_SOURCE.parent
+    if candidate.is_dir() and os.access(candidate, os.W_OK):
+        return candidate
+    return Path.home() / "Library" / "Caches" / "undrm"
+
+
 class UndrmError(Exception):
     pass
 
@@ -206,32 +214,48 @@ def _largest_gap(items: List[Line], axis: str, min_gap: float) -> Optional[int]:
     return best[1] if best else None
 
 
-def segment(lines: List[Line], col_gap: float, row_gap: float, depth: int = 0) -> List[List[Line]]:
+def segment(lines: List[Line], col_gap: float, row_gap: float, med_h: float,
+            depth: int = 0) -> List[List[Line]]:
     """Recursive XY-cut: split on the widest vertical gap (columns), else the widest
-    horizontal gap (rows); leaves are returned in reading order."""
+    horizontal gap (rows); leaves are returned in reading order.
+
+    A vertical cut is only accepted when both sides are plausible text columns
+    (wider than ~8 line heights and 20% of the block); otherwise a column of list
+    markers, speaker names or table-of-contents page numbers would be peeled off
+    the text it belongs to."""
     if len(lines) <= 1 or depth > 40:
         return [lines]
     items = list(lines)
     i = _largest_gap(items, "x", col_gap)
     if i is not None and i >= 2 and len(items) - i >= 2:
-        return (segment(items[:i], col_gap, row_gap, depth + 1)
-                + segment(items[i:], col_gap, row_gap, depth + 1))
+        block_w = max(l.x1 for l in items) - min(l.x0 for l in items)
+        min_ext = max(8.0 * med_h, 0.2 * block_w)
+        ext_left = max(l.x1 for l in items[:i]) - min(l.x0 for l in items[:i])
+        ext_right = max(l.x1 for l in items[i:]) - min(l.x0 for l in items[i:])
+        if min(ext_left, ext_right) >= min_ext:
+            return (segment(items[:i], col_gap, row_gap, med_h, depth + 1)
+                    + segment(items[i:], col_gap, row_gap, med_h, depth + 1))
     i = _largest_gap(items, "y", row_gap)
     if i is not None:
-        return (segment(items[:i], col_gap, row_gap, depth + 1)
-                + segment(items[i:], col_gap, row_gap, depth + 1))
+        return (segment(items[:i], col_gap, row_gap, med_h, depth + 1)
+                + segment(items[i:], col_gap, row_gap, med_h, depth + 1))
     return [items]
 
 
 def merge_rows(lines: List[Line]) -> List[List[Line]]:
-    """Group fragments that sit on the same baseline into rows, left to right."""
+    """Group fragments that share a baseline into rows, left to right.
+
+    Membership is by vertical overlap of the boxes (at least half of the smaller
+    box), so superscripts and other small fragments stay with their line."""
     rows: List[List[Line]] = []
     for line in sorted(lines, key=lambda l: (l.yc, l.x0)):
         placed = False
         for row in rows:
             ref = row[-1]
-            tol = 0.5 * min(ref.h, line.h) if min(ref.h, line.h) > 0 else 2.0
-            if abs(ref.yc - line.yc) <= tol:
+            small = min(ref.h, line.h)
+            overlap = min(ref.y1, line.y1) - max(ref.y0, line.y0)
+            same_row = (overlap >= 0.5 * small) if small > 0 else (abs(ref.yc - line.yc) <= 2.0)
+            if same_row:
                 row.append(line)
                 placed = True
                 break
@@ -239,7 +263,7 @@ def merge_rows(lines: List[Line]) -> List[List[Line]]:
             rows.append([line])
     for row in rows:
         row.sort(key=lambda l: l.x0)
-    rows.sort(key=lambda r: min(l.y0 for l in r))
+    rows.sort(key=lambda r: statistics.median([l.yc for l in r]))
     return rows
 
 
@@ -269,9 +293,9 @@ def layout_page(page: Page, keep_lines: bool, xy_cut: bool, dehyphenate: bool,
         page.blocks, page.text = [], ""
         return
     med_h = median([l.h for l in lines], 12.0)
-    col_gap = max(12.0, col_gap_factor * med_h)
+    col_gap = max(8.0, col_gap_factor * med_h)
     row_gap = max(6.0, row_gap_factor * med_h)
-    groups = segment(lines, col_gap, row_gap) if xy_cut else [lines]
+    groups = segment(lines, col_gap, row_gap, med_h) if xy_cut else [lines]
     blocks: List[List[str]] = []
     for group in groups:
         rows = merge_rows(group)
@@ -282,6 +306,13 @@ def layout_page(page: Page, keep_lines: bool, xy_cut: bool, dehyphenate: bool,
         pitches = [row_tops[i] - row_tops[i - 1] for i in range(1, len(rows))]
         pitch = median(pitches, med_h * 1.3)
         left_edge = min(row_lefts)
+        indented = [rl - left_edge > 1.0 * med_h for rl in row_lefts]
+        flush = [rl - left_edge <= 0.3 * med_h for rl in row_lefts]
+        n_ind, n_fl = sum(indented), sum(flush)
+        # Hanging indent (bibliographies, outlines, wrapped list items): indented rows are
+        # continuations and each flush row starts an entry. Ties go by the first row: a
+        # group that opens flush is hanging, one that opens indented uses first-line indents.
+        hanging = n_ind > n_fl or (n_ind == n_fl and n_ind > 0 and flush[0])
         current: List[str] = []
         for i, text in enumerate(row_texts):
             new_para = False
@@ -289,7 +320,9 @@ def layout_page(page: Page, keep_lines: bool, xy_cut: bool, dehyphenate: bool,
                 gap = row_tops[i] - row_bottoms[i - 1]
                 if gap > para_gap_factor * pitch or row_tops[i] - row_tops[i - 1] > 1.8 * pitch:
                     new_para = True
-                elif row_lefts[i] - left_edge > 1.0 * med_h and row_lefts[i - 1] - left_edge <= 0.3 * med_h:
+                elif hanging:
+                    new_para = flush[i]
+                elif indented[i] and flush[i - 1]:
                     new_para = True
             if new_para and current:
                 blocks.append(current)
@@ -417,6 +450,14 @@ def helvetica_width(data: bytes) -> float:
     return total / 1000.0
 
 
+def _winansi_encodable(ch: str) -> bool:
+    try:
+        ch.encode("cp1252")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
 def pdf_string(text: str) -> bytes:
     data = text.encode("cp1252", errors="replace")
     data = bytes(b for b in data if b >= 32 or b in (9,))
@@ -442,7 +483,10 @@ def jpeg_info(data: bytes) -> Tuple[int, int, int]:
             i += 1
             continue
         marker = data[i + 1]
-        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+        if marker == 0xFF:  # fill byte before a marker
+            i += 1
+            continue
+        if marker in (0xD8, 0xD9, 0x01) or 0xD0 <= marker <= 0xD7:
             i += 2
             continue
         if i + 4 > n:
@@ -478,6 +522,18 @@ def png_idat(data: bytes) -> bytes:
     return b"".join(chunks)
 
 
+def flatten_with_pillow(png: Path):
+    """Open a PNG with Pillow and composite any transparency onto white. Returns an RGB image."""
+    from PIL import Image  # type: ignore
+    with Image.open(png) as im:
+        if im.mode in ("RGBA", "LA") or "transparency" in im.info:
+            rgba = im.convert("RGBA")
+            flat = Image.new("RGB", rgba.size, "white")
+            flat.paste(rgba, mask=rgba.getchannel("A"))
+            return flat
+        return im.convert("RGB")
+
+
 def convert_to_jpeg(png: Path, out: Path, quality: int) -> None:
     sips = shutil.which("sips")
     if sips:
@@ -487,12 +543,11 @@ def convert_to_jpeg(png: Path, out: Path, quality: int) -> None:
             return
         log("sips failed (%s); trying Pillow" % proc.stderr.strip(), "warn")
     try:
-        from PIL import Image  # type: ignore
+        flat = flatten_with_pillow(png)
     except ImportError:
         raise UndrmError("cannot convert %s to JPEG: neither sips (macOS) nor Pillow is available. "
                          "Use --pdf-image png or --no-pdf." % png.name)
-    with Image.open(png) as im:
-        im.convert("RGB").save(out, "JPEG", quality=quality)
+    flat.save(out, "JPEG", quality=quality)
 
 
 class PDFImage:
@@ -507,12 +562,25 @@ def load_pdf_image(png: Path, mode: str, quality: int, work_dir: Path) -> PDFIma
     raw = png.read_bytes()
     if mode == "png":
         width, height, depth, ctype, interlace = png_info(raw)
+        if not (depth == 8 and interlace == 0 and ctype in (0, 2)):
+            # Window captures usually carry an alpha channel; flatten to RGB losslessly when
+            # Pillow is available so the PNG path stays lossless.
+            try:
+                flat = flatten_with_pillow(png)
+                work_dir.mkdir(parents=True, exist_ok=True)
+                flat_png = work_dir / (png.stem + "-rgb.png")
+                flat.save(flat_png, "PNG")
+                raw = flat_png.read_bytes()
+                width, height, depth, ctype, interlace = png_info(raw)
+            except ImportError:
+                pass
         if depth == 8 and interlace == 0 and ctype in (0, 2):
             colors = 3 if ctype == 2 else 1
             parms = b"<< /Predictor 15 /Colors %d /BitsPerComponent 8 /Columns %d >>" % (colors, width)
             return PDFImage(width, height, "/DeviceRGB" if colors == 3 else "/DeviceGray",
                             "/FlateDecode", png_idat(raw), parms)
-        log("%s is not 8-bit RGB/gray PNG (type %d); embedding as JPEG instead" % (png.name, ctype), "warn")
+        log("%s is not 8-bit RGB/gray PNG (type %d) and Pillow is not available to flatten it; "
+            "embedding as JPEG instead" % (png.name, ctype), "warn")
     work_dir.mkdir(parents=True, exist_ok=True)
     jpg = work_dir / (png.stem + ".jpg")
     convert_to_jpeg(png, jpg, quality)
@@ -566,6 +634,7 @@ def write_pdf(pages: List[Page], path: Path, title: str, page_width: float, imag
     pages_id = pdf.reserve()
     font_id = pdf.add(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>")
     page_ids: List[int] = []
+    unencodable = 0
     for page in pages:
         lw, lh = page.logical["width"], page.logical["height"]
         if lw <= 0 or lh <= 0:
@@ -585,6 +654,7 @@ def write_pdf(pages: List[Page], path: Path, title: str, page_width: float, imag
             content += b"1 0 0 rg\n"
         for line in page.lines:
             fs = max(1.0, line.h * scale)
+            unencodable += sum(1 for ch in line.text if not _winansi_encodable(ch))
             encoded = pdf_string(line.text)
             natural = helvetica_width(line.text.encode("cp1252", errors="replace")) * fs
             box_w = max(0.5, line.w * scale)
@@ -601,6 +671,9 @@ def write_pdf(pages: List[Page], path: Path, title: str, page_width: float, imag
     kids = b" ".join(b"%d 0 R" % pid for pid in page_ids)
     pdf.set(pages_id, b"<< /Type /Pages /Kids [%s] /Count %d >>" % (kids, len(page_ids)))
     pdf.set(catalog_id, b"<< /Type /Catalog /Pages %d 0 R >>" % pages_id)
+    if unencodable:
+        log("%d character(s) outside WinAnsi (e.g. Greek, math symbols, CJK) were written as '?' in the "
+            "PDF text layer; document.txt/.md/.json keep them" % unencodable, "warn")
     now = dt.datetime.now().strftime("D:%Y%m%d%H%M%S")
     info_id = pdf.add(b"<< /Title " + pdf_text_string(title) + b" /Producer (Un-DRM undrm_assemble.py) /Creator (Peekaboo see --ocr) /CreationDate (" + now.encode() + b") >>")
     path.write_bytes(pdf.build(catalog_id, info_id))
@@ -621,11 +694,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--keep-lines", action="store_true", help="keep OCR line breaks instead of reflowing paragraphs")
     p.add_argument("--no-dehyphenate", action="store_true", help="do not join words hyphenated across lines")
     p.add_argument("--no-xy-cut", action="store_true", help="disable column detection; order lines top to bottom only")
-    p.add_argument("--col-gap", type=float, default=1.2, help="column gap threshold in line heights (default 1.2)")
+    p.add_argument("--col-gap", type=float, default=0.8, help="column gap threshold in line heights (default 0.8; lower it for tight gutters)")
     p.add_argument("--row-gap", type=float, default=1.0, help="row split threshold in line heights (default 1.0)")
     p.add_argument("--para-gap", type=float, default=0.6, help="paragraph break threshold in line pitches (default 0.6)")
     p.add_argument("--pdf-page-width", type=float, default=612.0, help="PDF page width in points (default 612 = 8.5in)")
-    p.add_argument("--pdf-image", choices=["jpeg", "png"], default="jpeg", help="how to embed page images (default jpeg via sips)")
+    p.add_argument("--pdf-image", choices=["jpeg", "png"], default="jpeg", help="how to embed page images: jpeg via sips/Pillow (default) or lossless png (captures with an alpha channel are flattened with Pillow first)")
     p.add_argument("--pdf-quality", type=int, default=85, help="JPEG quality for the PDF (default 85)")
     p.add_argument("--pdf-visible-text", action="store_true", help="debug: draw the OCR text layer visibly in red")
     p.add_argument("--reocr", action="store_true", help="re-run Apple Vision in accurate mode on the PNGs (needs swiftc)")
@@ -678,7 +751,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             page = load_page(entry, capture_dir, manifest, args.min_confidence)
             if args.reocr:
                 log("re-OCR page %d" % page.index)
-                reocr_with_vision(page, max(args.min_confidence, 0.3), args.languages, work_dir)
+                reocr_with_vision(page, max(args.min_confidence, 0.3), args.languages, vision_build_dir())
             layout_page(page, args.keep_lines, not args.no_xy_cut, not args.no_dehyphenate,
                         args.col_gap, args.row_gap, args.para_gap)
             pages.append(page)

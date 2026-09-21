@@ -19,7 +19,7 @@ Markdown, JSON and a searchable PDF.
     <out>/pages/page-0001.png     exact-window capture (Retina scale by default)
     <out>/pages/page-0001.json    raw `peekaboo see --ocr --json` envelope
 
-Requirements: macOS 15+, Peekaboo 4.4+ (`peekaboo see --ocr`), Python 3.9+,
+Requirements: macOS 15+, Peekaboo 4.1+ (`peekaboo see --ocr`; 4.4+ recommended), Python 3.9+,
 Screen Recording + Accessibility granted to the Peekaboo host.
 
 Example:
@@ -169,6 +169,37 @@ def is_ocr_element(element: dict) -> bool:
 
 def ocr_char_count(elements: List[dict]) -> int:
     return sum(len((e.get("label") or "").strip()) for e in elements)
+
+
+BACKGROUND_REFUSAL_CODES = ("INTERACTION_FAILED", "VALIDATION_ERROR", "INVALID_INPUT")
+
+
+def is_background_refusal(exc: "PeekabooError") -> bool:
+    """True only for Peekaboo's pre-dispatch refusals of background key delivery.
+
+    Timeouts, missing apps/windows, permission errors and failures reported after a key
+    was already dispatched must not be answered with a second (foreground) press."""
+    if exc.code not in BACKGROUND_REFUSAL_CODES or not exc.envelope:
+        return False
+    env = exc.envelope
+    err = env.get("error") or {}
+    outcome = env.get("outcome") or {}
+    if err.get("mutation_dispatched") is True or outcome.get("mutation_dispatched") is True:
+        return False
+    return env.get("effect") in (None, "refused")
+
+
+def text_fingerprint(elements: List[dict]) -> str:
+    joined = "\n".join((e.get("label") or "").strip() for e in elements)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
+def vision_build_dir() -> Path:
+    """Where the compiled Vision helper lives: next to its source when writable, else a cache dir."""
+    candidate = VISION_TOOL_SOURCE.parent
+    if candidate.is_dir() and os.access(candidate, os.W_OK):
+        return candidate
+    return Path.home() / "Library" / "Caches" / "undrm"
 
 
 def version_tuple(text: str) -> Tuple[int, ...]:
@@ -356,7 +387,9 @@ class CaptureSession:
         self.window_bounds: Optional[Dict[str, float]] = None
         self.retina = not args.no_retina
         self.ocr_engine = args.ocr_engine
-        self.vision = VisionOCR(self.out / ".tools", verbose=args.verbose)
+        self.vision = VisionOCR(vision_build_dir(), verbose=args.verbose)
+        self.wait_timed_out = False
+        self.clean_enabled = not args.keep_snapshots
         self.pages: List[dict] = []
         self.warnings: List[str] = []
         self.snapshot_ids: List[str] = []
@@ -379,13 +412,14 @@ class CaptureSession:
         proc = self.pb.text(["--version"])
         self.peekaboo_version = (proc.stdout or proc.stderr).strip().splitlines()[0] if (proc.stdout or proc.stderr).strip() else "unknown"
         log("peekaboo: %s" % self.peekaboo_version)
-        if version_tuple(self.peekaboo_version) < (4, 4) and not self.args.skip_checks:
-            log("Peekaboo 4.4+ is required for `see --ocr` (found %s)" % self.peekaboo_version, "warn")
-        if self.ocr_engine in ("peekaboo", "auto"):
+        if version_tuple(self.peekaboo_version) < (4, 1) and not self.args.skip_checks:
+            log("Peekaboo 4.1+ is required for `see --ocr` (found %s); 4.4+ is recommended"
+                % self.peekaboo_version, "warn")
+        if self.ocr_engine == "peekaboo":
             help_text = self.pb.text(["see", "--help"])
             combined = (help_text.stdout or "") + (help_text.stderr or "")
             if "--ocr" not in combined and not self.args.skip_checks:
-                raise UndrmError("this Peekaboo build has no `see --ocr`; upgrade to 4.4+ "
+                raise UndrmError("this Peekaboo build has no `see --ocr`; upgrade to 4.1+ "
                                  "(brew upgrade openclaw/tap/peekaboo) or use --ocr-engine vision")
         if self.ocr_engine == "vision" and not VisionOCR.available():
             raise UndrmError("--ocr-engine vision needs tools/vision-ocr.swift and the Swift toolchain "
@@ -538,8 +572,8 @@ class CaptureSession:
                 log("window %d %r %s" % (self.window_id, self.window_title,
                                          "(%s)" % cap if cap else ""))
                 if cap == "pixels_only":
-                    log("window reports pixels_only accessibility; `see --ocr` may fail and fall back to the "
-                        "Vision engine if available", "warn")
+                    log("window exposes no accessibility elements; pages where Vision finds no text will be "
+                        "recorded as blank (Peekaboo reports them as ACCESSIBILITY_INCOMPLETE)", "warn")
                 return
             if time.monotonic() > deadline:
                 break
@@ -640,7 +674,10 @@ class CaptureSession:
             self.pb.run(["menu", "click", "--pid", str(self.pid), "--path", path])
             return True
         except PeekabooError as exc:
-            if exc.code in ("MENU_ITEM_NOT_FOUND", "MENU_BAR_NOT_FOUND") or "not found" in exc.message.lower():
+            missing = exc.code in ("MENU_ITEM_NOT_FOUND", "MENU_BAR_NOT_FOUND") or (
+                exc.code not in ("APP_NOT_FOUND", "WINDOW_NOT_FOUND", "TIMEOUT", "NO_JSON")
+                and re.search(r"\bmenu\b.*\bnot found\b", exc.message, re.IGNORECASE) is not None)
+            if missing:
                 if optional:
                     log("menu item %r not present (skipped)" % path, "warn")
                     return False
@@ -654,10 +691,10 @@ class CaptureSession:
             raise
 
     def run_setup(self) -> None:
-        steps = list(self.profile.get("setup") or [])
+        steps = [] if self.args.skip_setup else list(self.profile.get("setup") or [])
         for extra in self.args.setup_menu or []:
             steps.append({"menu": extra})
-        if self.args.skip_setup or not steps:
+        if not steps:
             return
         known = self.menu_paths()
         for step in steps:
@@ -669,7 +706,7 @@ class CaptureSession:
                 self.press_key(step["key"], foreground=bool(step.get("foreground", True)))
             elif "sleep" in step:
                 time.sleep(float(step["sleep"]))
-            time.sleep(float(step.get("settle", 0.3)))
+            time.sleep(float(step.get("settle", 0.0 if "sleep" in step else 0.3)))
         time.sleep(self.args.setup_settle)
         self.refresh_window_bounds()
 
@@ -678,26 +715,38 @@ class CaptureSession:
     def _retina_flag(self) -> List[str]:
         return ["--retina"] if self.retina else []
 
+    def pixel_capture(self, path: Path) -> dict:
+        """`see --no-elements` of the exact window into `path`; returns the data envelope."""
+        data = self.pb.data(["see", "--pid", str(self.pid), "--window-id", str(self.window_id),
+                             "--no-elements", "--path", str(path)] + self._retina_flag(), timeout=90)
+        snap = data.get("snapshot_id")
+        if snap:
+            self.snapshot_ids.append(snap)
+        files = data.get("files") or []
+        written = Path(files[0]["path"]) if files and isinstance(files[0], dict) and files[0].get("path") else path
+        if written != path and written.exists() and not path.exists():
+            shutil.move(str(written), str(path))
+        if not path.exists():
+            raise UndrmError("capture did not write %s" % path)
+        return data
+
     def probe_hash(self) -> str:
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.tmp_dir / ("probe-%d.png" % self.pb.calls)
-        data = self.pb.data(["see", "--pid", str(self.pid), "--window-id", str(self.window_id),
-                             "--no-elements", "--path", str(tmp)] + self._retina_flag(), timeout=90)
-        files = data.get("files") or []
-        path = Path(files[0]["path"]) if files and files[0].get("path") else tmp
-        if not path.exists():
-            raise UndrmError("probe capture did not produce %s" % path)
-        digest = sha256_file(path)
+        self.pixel_capture(tmp)
+        digest = sha256_file(tmp)
         try:
-            path.unlink()
+            tmp.unlink()
         except OSError:
             pass
         return digest
 
     def wait_for_page(self, prev_hash: Optional[str]) -> Optional[str]:
         """Poll until the window is stable. Returns the stable hash, or None when the
-        window never changed from prev_hash (advance had no effect)."""
+        window never changed from prev_hash (advance had no effect). Sets
+        self.wait_timed_out when the window never settled and the last probe is used."""
         a = self.args
+        self.wait_timed_out = False
         started = time.monotonic()
         deadline = started + a.settle_timeout
         last: Optional[str] = None
@@ -719,6 +768,7 @@ class CaptureSession:
             last = digest
             if now > deadline:
                 if last is not None and last != prev_hash:
+                    self.wait_timed_out = True
                     self.note("page did not settle within %.0fs; capturing anyway" % a.settle_timeout)
                     return last
                 return None
@@ -738,7 +788,7 @@ class CaptureSession:
             try:
                 self.press_key(self.next_key, foreground=False)
             except PeekabooError as exc:
-                if self.args.no_foreground_fallback:
+                if self.args.no_foreground_fallback or not is_background_refusal(exc):
                     raise
                 log("background key press refused (%s); switching to foreground key presses. "
                     "Do not use the Mac while the capture runs." % exc.code, "warn")
@@ -768,22 +818,30 @@ class CaptureSession:
                 break
             except PeekabooError as exc:
                 last_exc = exc
-                if exc.code in ("ACCESSIBILITY_INCOMPLETE", "TIMEOUT") and attempt == 0:
-                    log("see --ocr: %s (retrying once)" % exc.code, "warn")
+                if exc.code == "TIMEOUT" and attempt == 0:
+                    log("see --ocr timed out (retrying once)", "warn")
                     time.sleep(1.0)
                     continue
                 break
         if envelope is None:
             assert last_exc is not None
-            if last_exc.code == "ACCESSIBILITY_INCOMPLETE":
-                if self.ocr_engine == "auto" and VisionOCR.available():
-                    log("see --ocr cannot observe this window; falling back to the Vision OCR engine", "warn")
-                    self.ocr_engine = "vision"
-                    return self.vision_capture(png)
-                raise UndrmError("%s\n  This viewer exposes no accessibility elements, so `see --ocr` refuses. "
-                                 "Install the Swift toolchain (xcode-select --install) and rerun with "
-                                 "--ocr-engine vision." % last_exc)
-            raise last_exc
+            if last_exc.code != "ACCESSIBILITY_INCOMPLETE":
+                raise last_exc
+            # With --ocr, Peekaboo reports ACCESSIBILITY_INCOMPLETE only when the window exposed
+            # no accessibility elements AND Vision recognized no text: a blank or image-only
+            # page. The raster is still written to --path; record the page with no text.
+            if not png.exists():
+                self.pixel_capture(png)
+            envelope = {"success": True, "data": {
+                "ui_elements": [],
+                "coordinate_context": {"version": 1, "logical_space": "global_display_points",
+                                       "origin": "top_left", "logical_bounds": self.window_bounds},
+                "screenshot_raw": str(png),
+                "capture_mode": "window",
+                "observation": {"warnings": ["ACCESSIBILITY_INCOMPLETE: no accessibility elements and no "
+                                             "OCR text on this page (blank or image-only page)"]},
+            }}
+            return png, envelope, [], "peekaboo"
         data = envelope.get("data") or {}
         elements = [e for e in (data.get("ui_elements") or []) if is_ocr_element(e)]
         raw = data.get("screenshot_raw")
@@ -797,17 +855,11 @@ class CaptureSession:
         return png, envelope, elements, "peekaboo"
 
     def vision_capture(self, png: Path) -> Tuple[Path, dict, List[dict], str]:
-        data = self.pb.data(["see", "--pid", str(self.pid), "--window-id", str(self.window_id),
-                             "--no-elements", "--path", str(png)] + self._retina_flag(), timeout=90)
-        files = data.get("files") or []
-        written = Path(files[0]["path"]) if files and files[0].get("path") else png
-        if written != png and written.exists():
-            shutil.move(str(written), str(png))
-        if not png.exists():
-            raise UndrmError("capture did not write %s" % png)
+        data = self.pixel_capture(png)
         coords = None
         for obs in data.get("observations") or []:
-            coords = obs.get("coordinates") or coords
+            if isinstance(obs, dict):
+                coords = obs.get("coordinates") or coords
         logical = rect_from_json((coords or {}).get("logical_bounds")) or self.window_bounds
         if not logical:
             raise UndrmError("cannot map OCR results: no logical bounds for window %s" % self.window_id)
@@ -835,13 +887,22 @@ class CaptureSession:
         return png, envelope, elements, "vision"
 
     def clean_snapshots(self) -> None:
-        if self.args.keep_snapshots or not self.snapshot_ids:
+        if not self.clean_enabled:
+            self.snapshot_ids = []
             return
         for snap in self.snapshot_ids:
             try:
-                self.pb.run(["clean", "--snapshot", snap], timeout=30)
+                data = self.pb.data(["clean", "--snapshot", snap], timeout=30)
             except PeekabooError as exc:
                 log("clean --snapshot %s: %s" % (snap, exc.message), "debug")
+                continue
+            if data.get("not_found"):
+                # Snapshots held by Peekaboo's daemon are not on disk; the daemon prunes them
+                # itself, so further clean calls would be no-ops.
+                log("snapshots are held by the Peekaboo daemon (pruned by the daemon); skipping "
+                    "further clean calls", "debug")
+                self.clean_enabled = False
+                break
         self.snapshot_ids = []
 
     def note(self, message: str) -> None:
@@ -888,24 +949,31 @@ class CaptureSession:
     # ---- main loop ------------------------------------------------------------------
 
     def capture_page(self, page_no: int, settled_hash: str) -> dict:
-        attempts = 0
+        a = self.args
+        deadline = time.monotonic() + a.settle_timeout
         while True:
-            attempts += 1
-            png, envelope, elements, engine = self.ocr_capture(page_no)
-            chars = ocr_char_count(elements)
-            if chars < self.args.min_chars and attempts <= self.args.ocr_retries:
-                log("page %d: only %d characters recognized; waiting and retrying (%d/%d)"
-                    % (page_no, chars, attempts, self.args.ocr_retries), "warn")
-                time.sleep(self.args.retry_delay)
-                continue
-            break
-        if not self.args.no_postcheck:
-            after = self.probe_hash()
-            if after != settled_hash:
-                self.note("page %d changed while it was being captured; recapturing" % page_no)
+            attempts = 0
+            while True:
+                attempts += 1
                 png, envelope, elements, engine = self.ocr_capture(page_no)
                 chars = ocr_char_count(elements)
-                settled_hash = after
+                if chars < a.min_chars and attempts <= a.ocr_retries:
+                    log("page %d: only %d characters recognized; waiting and retrying (%d/%d)"
+                        % (page_no, chars, attempts, a.ocr_retries), "warn")
+                    time.sleep(a.retry_delay)
+                    continue
+                break
+            if a.no_postcheck:
+                break
+            after = self.probe_hash()
+            if after == settled_hash:
+                break  # the capture is bracketed by two identical probes
+            settled_hash = after
+            if time.monotonic() > deadline:
+                self.note("page %d kept changing for %.0fs while it was being captured; keeping the last capture"
+                          % (page_no, a.settle_timeout))
+                break
+            self.note("page %d changed while it was being captured; recapturing" % page_no)
         data = envelope.get("data") or {}
         json_path = self.pages_dir / ("page-%04d.json" % page_no)
         with open(json_path, "w") as fh:
@@ -915,13 +983,14 @@ class CaptureSession:
         trunc = data.get("truncation")
         if isinstance(trunc, dict) and trunc.get("warning"):
             page_warnings.append(trunc["warning"])
-        if chars < self.args.min_chars:
+        if chars < a.min_chars:
             page_warnings.append("only %d characters recognized" % chars)
         entry = {
             "index": page_no,
             "image": str(png.relative_to(self.out)),
             "see_json": str(json_path.relative_to(self.out)),
             "hash": settled_hash,
+            "text_hash": text_fingerprint(elements),
             "engine": engine,
             "ocr_elements": len(elements),
             "chars": chars,
@@ -934,6 +1003,23 @@ class CaptureSession:
         log("page %d: %d text lines, %d chars%s" % (page_no, len(elements), chars,
                                                     " [%s]" % "; ".join(page_warnings) if page_warnings else ""))
         return entry
+
+    def discard_page(self, entry: dict) -> None:
+        for key in ("image", "see_json"):
+            try:
+                (self.out / entry[key]).unlink()
+            except (OSError, KeyError):
+                pass
+
+    def _limit_reached(self, page_no: int) -> bool:
+        a = self.args
+        if a.pages is not None and page_no >= a.pages:
+            self.status, self.stop_reason = "complete", "requested page count reached"
+            return True
+        if page_no >= a.max_pages:
+            self.status, self.stop_reason = "stopped", "--max-pages reached"
+            return True
+        return False
 
     def run(self) -> int:
         a = self.args
@@ -951,14 +1037,11 @@ class CaptureSession:
         prev_hash: Optional[str] = None
         seen: Dict[str, int] = {}
         page_no = 0
+        unsettled_repeats = 0
         exit_code = 0
         try:
             while True:
-                if a.pages is not None and page_no >= a.pages:
-                    self.status, self.stop_reason = "complete", "requested page count reached"
-                    break
-                if page_no >= a.max_pages:
-                    self.status, self.stop_reason = "stopped", "--max-pages reached"
+                if self._limit_reached(page_no):
                     break
                 if page_no > 0:
                     self.advance()
@@ -984,15 +1067,31 @@ class CaptureSession:
                                                  "recorded as a duplicate (blank page or dropped page turn)"]})
                         self.pages.append(dup)
                         self.note("page %d recorded as a duplicate of page %d" % (page_no, dup["duplicate_of"]))
+                        self.write_manifest()
+                        if self._limit_reached(page_no):
+                            break
                 if settled is None:
                     self.status, self.stop_reason = "error", "the first page never settled"
                     exit_code = 1
                     break
+                entry = self.capture_page(page_no + 1, settled)
+                if self.wait_timed_out and self.pages and entry["text_hash"] == self.pages[-1]["text_hash"]:
+                    # The window never settles (something animates), so pixel hashes cannot tell
+                    # pages apart; fall back to the recognized text to detect the last page.
+                    unsettled_repeats += 1
+                    self.discard_page(entry)
+                    if unsettled_repeats > a.end_retries:
+                        self.status, self.stop_reason = ("complete", "the window never settles and its "
+                                                         "text stopped changing after advancing")
+                        break
+                    log("page never settled and its text matches the previous page; advancing again (%d/%d)"
+                        % (unsettled_repeats, a.end_retries))
+                    continue
+                unsettled_repeats = 0
                 page_no += 1
                 if settled in seen:
                     self.note("page %d looks identical to page %d" % (page_no, seen[settled]))
                 seen.setdefault(settled, page_no)
-                entry = self.capture_page(page_no, settled)
                 self.pages.append(entry)
                 prev_hash = entry["hash"]
                 self.write_manifest()
@@ -1004,6 +1103,9 @@ class CaptureSession:
             self.status, self.stop_reason = "error", str(exc)
             log(str(exc), "error")
             exit_code = 1
+        except Exception as exc:  # noqa: BLE001 - record the failure in the manifest, then re-raise
+            self.status, self.stop_reason = "error", "unexpected error: %r" % (exc,)
+            raise
         finally:
             self.write_manifest()
             self.clean_snapshots()
@@ -1013,7 +1115,6 @@ class CaptureSession:
         if self.pages:
             log("next: ./undrm_assemble.py %s" % shlex.quote(str(self.out)))
         return exit_code
-
 
 # ------------------------------------------------------------------------------ CLI
 
@@ -1027,7 +1128,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no-open", action="store_true", help="do not open --doc; target the viewer's existing window")
     g.add_argument("--window-title", help="pick the viewer window whose title contains this text")
     g.add_argument("--window-id", type=int, help="pick an exact WindowServer window id (see `peekaboo window list`)")
-    g.add_argument("--pages", type=int, help="capture exactly this many pages")
+    g.add_argument("--pages", type=int, help="stop after this many pages (the run still ends earlier at the end of the document)")
     g.add_argument("--max-pages", type=int, default=2000, help="safety cap (default 2000)")
     g.add_argument("--title", help="document title recorded in the manifest")
     g.add_argument("--out", help="capture directory (default captures/<name>-<timestamp>)")
@@ -1035,7 +1136,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("viewer layout")
     g.add_argument("--width", type=int, help="window width in points (profile default 1000)")
-    g.add_argument("--height", type=int, help="window height in points (default: screen height - 80)")
+    g.add_argument("--height", type=int, help="window height in points (default: visible screen height - 80, at least 600)")
     g.add_argument("--x", type=int, help="window x origin")
     g.add_argument("--y", type=int, help="window y origin")
     g.add_argument("--no-resize", action="store_true", help="leave the window geometry alone")
@@ -1056,13 +1157,13 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--settle-interval", type=float, default=0.35, help="seconds between probe captures (default 0.35)")
     g.add_argument("--settle-samples", type=int, default=2, help="identical consecutive probes required (default 2)")
     g.add_argument("--settle-timeout", type=float, default=20.0, help="give up waiting for a stable page after this (default 20s)")
-    g.add_argument("--end-grace", type=float, default=3.0, help="seconds of no change after advancing that mean 'last page' (default 3)")
+    g.add_argument("--end-grace", type=float, default=3.0, help="seconds of no change after advancing before the page is considered unchanged (default 3; raise it for viewers that render slowly)")
     g.add_argument("--no-postcheck", action="store_true", help="skip the probe that verifies the page did not change during OCR")
 
     g = p.add_argument_group("OCR")
-    g.add_argument("--ocr-engine", choices=["auto", "peekaboo", "vision"], default="auto",
-                   help="auto: `peekaboo see --ocr`, falling back to Apple Vision accurate mode via tools/vision-ocr.swift; "
-                        "vision: always use the accurate Vision engine (needs swiftc)")
+    g.add_argument("--ocr-engine", choices=["peekaboo", "vision"], default="peekaboo",
+                   help="peekaboo (default): `peekaboo see --ocr` (Apple Vision fast mode on the Peekaboo host); "
+                        "vision: Apple Vision accurate mode via tools/vision-ocr.swift (needs swiftc)")
     g.add_argument("--see-timeout", type=float, default=60.0, help="peekaboo see --timeout for OCR captures (default 60s)")
     g.add_argument("--ax-max-elements", type=int, help="pass --max-elements to peekaboo see for very busy windows")
     g.add_argument("--min-chars", type=int, default=20, help="retry the capture when fewer characters are recognized (default 20)")
@@ -1104,6 +1205,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except UndrmError as exc:
         log(str(exc), "error")
         return 1
+    except KeyboardInterrupt:
+        log("interrupted", "error")
+        return 130
 
 
 if __name__ == "__main__":

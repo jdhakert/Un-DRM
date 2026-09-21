@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 """
 A stand-in for the `peekaboo` CLI used by the test-suite (and handy for dry runs on
-non-Mac machines). It emulates just enough of Peekaboo 4.4's JSON envelopes for
+non-Mac machines). It emulates just enough of Peekaboo 4.1+'s JSON envelopes for
 undrm_capture.py: a viewer app ("Preview") showing a six-page document.
 
-Simulated quirks:
-  * the first probe after a page turn returns a transition frame (animation)
+Simulated behavior:
+  * the first probe after a page turn returns a transition frame (animation);
+    FAKE_PB_TRANSITION_FRAMES=n changes how many
   * page 5 is a blank page identical to page 4 (exercises --end-retries)
-  * background `press` is refused so the capture falls back to foreground keys
-  * "View > Hide Sidebar" does not exist (exercises optional setup steps)
+  * background `press` is refused with a pre-dispatch refusal envelope unless
+    FAKE_PB_ALLOW_BACKGROUND_PRESS=1 (exercises the foreground fallback)
+  * every `see` publishes a snapshot id that `clean --snapshot` must remove; unknown
+    ids answer not_found like the real CLI. FAKE_PB_DAEMON_SNAPSHOTS=1 answers
+    not_found for every id (daemon-held snapshots)
+  * FAKE_PB_NO_AX=1: the viewer exposes no accessibility elements, so `see --ocr`
+    on a page with no recognizable text fails with ACCESSIBILITY_INCOMPLETE after
+    writing the PNG (Peekaboo's real semantics for blank pages)
+  * FAKE_PB_NOISE=1: every capture differs by a trailer, like a window that never
+    settles
 
 State lives in $FAKE_PB_STATE (JSON); rendered pages go next to it.
 """
@@ -66,7 +75,7 @@ def load_state() -> dict:
         return json.loads(STATE_PATH.read_text())
     return {"launched": False, "page": 1, "transition": 0,
             "bounds": {"x": WIN_X, "y": WIN_Y, "width": 800, "height": 600}, "doc": None,
-            "log": []}
+            "log": [], "snapshots": [], "see_calls": 0}
 
 
 def save_state(state: dict) -> None:
@@ -83,8 +92,20 @@ def out(data, success=True, error=None, extra=None):
     sys.exit(0 if success else 1)
 
 
-def fail(code, message, hint=None):
-    out(None, success=False, error={"code": code, "message": message, "hint": hint})
+def fail(code, message, hint=None, refused=False):
+    error = {"code": code, "message": message, "hint": hint}
+    extra = None
+    if refused:
+        error.update({"mutation_dispatched": False, "retry_safe": True})
+        extra = {"effect": "refused"}
+    out(None, success=False, error=error, extra=extra)
+
+
+def publish_snapshot(state, seed):
+    snap = snapshot_id(seed)
+    state.setdefault("snapshots", []).append(snap)
+    save_state(state)
+    return snap
 
 
 def opt(args, name, default=None):
@@ -247,24 +268,26 @@ def main(argv):
         if sub == "list":
             out({"app": "Preview", "menu_structure": [
                 {"title": "View", "enabled": True, "items": [
+                    {"title": "Content Only", "enabled": True, "shortcut": "⌥⌘1"},
+                    {"title": "Thumbnails", "enabled": True, "shortcut": "⌥⌘2"},
                     {"title": "Continuous Scroll", "enabled": True},
                     {"title": "Single Page", "enabled": True},
                     {"title": "Two Pages", "enabled": True},
-                    {"title": "Show Sidebar", "enabled": True},
-                    {"title": "Zoom to Fit", "enabled": True}]},
+                    {"title": "Zoom to Fit", "enabled": True, "shortcut": "⌘9"}]},
                 {"title": "Go", "enabled": True, "items": [
                     {"title": "Back", "enabled": True},
                     {"title": "Next Page", "enabled": True, "shortcut": "→"},
                     {"title": "Previous Page", "enabled": True}]}]})
         if sub == "click":
             path = opt(args, "--path") or opt(args, "--item")
-            if path in ("View > Single Page", "View > Zoom to Fit", "View > Continuous Scroll"):
+            if path in ("View > Single Page", "View > Zoom to Fit", "View > Continuous Scroll",
+                        "View > Content Only", "View > Thumbnails"):
                 out({"action": "menu_click", "app": "Preview", "menu_path": path, "clicked_item": path.split(">")[-1].strip()},
                     extra={"effect": "confirmed"})
             if path == "Go > Next Page":
                 if state["page"] < len(PAGES):
                     state["page"] += 1
-                    state["transition"] = 1
+                    state["transition"] = int(os.environ.get("FAKE_PB_TRANSITION_FRAMES", "1"))
                     save_state(state)
                 out({"action": "menu_click", "app": "Preview", "menu_path": path, "clicked_item": "Next Page"},
                     extra={"effect": "confirmed"})
@@ -273,12 +296,12 @@ def main(argv):
     if cmd == "press":
         if "--foreground" not in args and os.environ.get("FAKE_PB_ALLOW_BACKGROUND_PRESS") != "1":
             fail("INTERACTION_FAILED", "This automation host does not support focused exact-window background hotkeys.",
-                 "Update the Peekaboo host and retry with a fresh exact-window target.")
+                 "Update the Peekaboo host and retry with a fresh exact-window target.", refused=True)
         key = args[0].lower()
         if key in ("right", "down", "pagedown", "space"):
             if state["page"] < len(PAGES):
                 state["page"] += 1
-                state["transition"] = 1
+                state["transition"] = int(os.environ.get("FAKE_PB_TRANSITION_FRAMES", "1"))
                 save_state(state)
         out({"keys": [key], "totalPresses": 1, "count": 1, "deliveryMode": "foreground" if "--foreground" in args else "background",
              "targetPID": PID, "executionTime": 0.01}, extra={"effect": "unverifiable"})
@@ -295,6 +318,10 @@ def main(argv):
             state["transition"] -= 1
             save_state(state)
         png = render(state["page"], transition)
+        state["see_calls"] = state.get("see_calls", 0) + 1
+        save_state(state)
+        if os.environ.get("FAKE_PB_NOISE") == "1":
+            png += b"\x00" + str(state["see_calls"]).encode()  # trailing bytes after IEND: unique, still decodable
         Path(path).write_bytes(png)
         logical = [[bounds["x"], bounds["y"]], [bounds["width"], bounds["height"]]]  # Swift CGRect encoding
         if "--no-elements" in args:
@@ -302,15 +329,20 @@ def main(argv):
                  "observations": [{"spans": [], "warnings": [], "coordinates": {
                      "coordinate_space": "global_display_points", "logical_bounds": logical,
                      "image_size_pixels": {"width": WIN_W, "height": WIN_H}, "scale_factor": 1}}],
-                 "snapshot_id": snapshot_id(path)})
+                 "snapshot_id": publish_snapshot(state, path + str(state["see_calls"]))})
         if "--ocr" in args:
-            if os.environ.get("FAKE_PB_AX_INCOMPLETE") == "1":
-                fail("ACCESSIBILITY_INCOMPLETE", "Exact window %d returned no usable Accessibility elements." % WINDOW_ID)
-            out({"snapshot_id": snapshot_id(path + "ocr"), "snapshot_reusable": True, "semantic_scope": "exact_or_requested",
+            elements = ocr_elements(state["page"], bounds)
+            if os.environ.get("FAKE_PB_NO_AX") == "1":
+                elements = [e for e in elements if e.get("description") == "ocr"]
+                if not elements:
+                    # Real Peekaboo: no AX elements and no OCR text -> evidence policy refuses after
+                    # writing the raster to --path.
+                    fail("ACCESSIBILITY_INCOMPLETE", "Exact window %d returned no usable Accessibility elements." % WINDOW_ID)
+            out({"snapshot_id": publish_snapshot(state, path + "ocr" + str(state["see_calls"])), "snapshot_reusable": True, "semantic_scope": "exact_or_requested",
                  "mutation_targeting_available": True, "screenshot_raw": path, "screenshot_annotated": "",
                  "ui_map": "/tmp/ui_map.json", "application_name": "Preview", "window_title": "doc", "is_dialog": False,
                  "element_count": 0, "interactable_count": 1, "capture_mode": "window", "execution_time": 0.4,
-                 "ui_elements": ocr_elements(state["page"], bounds),
+                 "ui_elements": elements,
                  "observation": {"spans": [], "warnings": []},
                  "coordinate_context": {"version": 1, "logical_space": "global_display_points", "origin": "top_left",
                                         "logical_bounds": logical, "delivered_image_size": [WIN_W, WIN_H],
@@ -318,7 +350,14 @@ def main(argv):
         fail("INVALID_INPUT", "unsupported see form in the fake")
 
     if cmd == "clean":
-        out({"removed": 1, "bytes_freed": 1000, "executionTime": 0.001})
+        snap = opt(args, "--snapshot")
+        if os.environ.get("FAKE_PB_DAEMON_SNAPSHOTS") == "1" or snap not in state.get("snapshots", []):
+            out({"snapshotsRemoved": 0, "bytesFreed": 0, "snapshotDetails": [], "dryRun": False, "not_found": True,
+                 "executionTime": 0.001})
+        state["snapshots"].remove(snap)
+        save_state(state)
+        out({"snapshotsRemoved": 1, "bytesFreed": 1000, "snapshotDetails": [snap], "dryRun": False,
+             "executionTime": 0.001})
 
     fail("INVALID_INPUT", "unsupported command: %s" % cmd)
 
